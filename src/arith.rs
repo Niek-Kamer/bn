@@ -523,6 +523,18 @@ fn mac_digit(from_index: usize, acc: &mut [u128; 4], b: &[u128; 2], c: u128) {
 
 #[inline]
 fn mul_reduce(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
+    #[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+    mul_reduce_asm(this, by, modulus, inv);
+    #[cfg(not(all(feature = "cortex-m33-asm", target_arch = "arm")))]
+    mul_reduce_rust(this, by, modulus, inv);
+}
+
+// Kept as the portable reference and the default on non-arm targets.
+// On firmware with `cortex-m33-asm` enabled, the dispatcher calls the asm
+// version instead, so this body becomes unused in that build.
+#[allow(dead_code)]
+#[inline(always)]
+fn mul_reduce_rust(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
     // The Montgomery reduction here is based on Algorithm 14.32 in
     // Handbook of Applied Cryptography
     // <http://cacr.uwaterloo.ca/hac/about/chap14.pdf>.
@@ -542,6 +554,408 @@ fn mul_reduce(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u1
     }
 
     this.copy_from_slice(&res[2..]);
+}
+
+#[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+fn mul_reduce_asm(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
+    extern "C" {
+        fn mul_reduce_armv8m(
+            this: *mut u32,
+            by: *const u32,
+            modulus: *const u32,
+            inv_low: u32,
+        );
+    }
+    // [u128; 2] is 32 bytes with 16-byte alignment, which is a valid view
+    // as 8 × u32 in the same memory (u32 needs 4-byte alignment). The asm
+    // function reads/writes exactly that view and only uses `inv` mod 2^32.
+    let inv_low = inv as u32;
+    // SAFETY: the three slices have 8 × u32 of valid memory each (32 bytes,
+    // 16-byte aligned). `mul_reduce_armv8m` reads 8 u32s from `by` and
+    // `modulus`, reads and writes 8 u32s at `this`, and uses `inv_low` as
+    // a scalar. No aliasing between the three buffers (caller-enforced by
+    // passing distinct `&mut`/`&` references).
+    unsafe {
+        mul_reduce_armv8m(
+            this.as_mut_ptr().cast::<u32>(),
+            by.as_ptr().cast::<u32>(),
+            modulus.as_ptr().cast::<u32>(),
+            inv_low,
+        );
+    }
+}
+
+// ARMv8-M hand-written Montgomery reduction.
+//
+// Algorithm: Separated Operand Scanning (SOS) on 8 × u32 limbs. Phase 1 is
+// an 8×8 schoolbook a*b written into a 16-word accumulator `t`. Phase 2 is
+// 8 Montgomery-reduction rows, each multiplying the modulus by m = t[i] *
+// inv_low (mod 2^32) and adding into t[i..i+8] with full carry propagation
+// through the top of t. After Phase 2, t[8..16] holds the result.
+//
+// The inner step maps exactly onto UMAAL: `t[k] := a_i*b_j + t[k] + carry`
+// with the new carry in one register and the low 32 bits in another.
+//
+// Register map (AAPCS32) — tuned to keep `by` live in registers across all
+// of Phase 1 and `modulus` live across all of Phase 2, avoiding the 64+64
+// redundant LDRs the first pass spent on operand reloads:
+//   r0    = this ptr            (kept)
+//   r1    = a[i] (phase 1) / m (phase 2) — row-multiplier scratch
+//   r2    = modulus ptr         (kept, used to reload r4..r11 between phases)
+//   r3    = inv_low             (kept)
+//   r4..r11 = b[0..7] in phase 1, p[0..7] in phase 2
+//   r12   = t[i+j] (UMAAL RdLo) scratch
+//   lr    = carry (UMAAL RdHi) scratch, pre-saved by push frame
+//   sp    = 64-byte t buffer
+//
+// Section placement: `.ram_text.*` so the firmware's pre_init copy moves
+// this function into SRAM at boot. Running from RAM avoids XIP-cache
+// pressure on the rest of the hot pairing path, wich still runs from flash.
+#[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+core::arch::global_asm!(
+    r#"
+    .syntax unified
+    .thumb
+    .cpu cortex-m33
+
+    // UMAAL step using the row multiplier in r1 and a preloaded column
+    // operand register (b[j] in phase 1, p[j] in phase 2). tij lives in r12,
+    // carry in lr.
+    .macro UMAAL_STEP col_reg, tij_off
+        ldr     r12, [sp, #\tij_off]
+        umaal   r12, lr, r1, \col_reg
+        str     r12, [sp, #\tij_off]
+    .endm
+
+    // Phase 1 outer loop row i: a[i] -> r1, then 8 UMAALs against b[0..7]
+    // which are held in r4..r11 for the duration of Phase 1.
+    .macro MUL_ROW_REG i
+        ldr     r1, [r0, #4*\i]
+        movs    lr, #0
+        UMAAL_STEP r4,  4*\i
+        UMAAL_STEP r5,  4*\i + 4
+        UMAAL_STEP r6,  4*\i + 8
+        UMAAL_STEP r7,  4*\i + 12
+        UMAAL_STEP r8,  4*\i + 16
+        UMAAL_STEP r9,  4*\i + 20
+        UMAAL_STEP r10, 4*\i + 24
+        UMAAL_STEP r11, 4*\i + 28
+        str     lr, [sp, #4*\i + 32]
+    .endm
+
+    // Specialized Phase 1 row 0. t[0..7] is uninitialized on entry; each
+    // UMAAL's RdLo is seeded with `movs r12, #0` rather than a load from
+    // stack. Saves 8 LDRs in row 0 and removes the need to zero-init
+    // t[0..7] upfront.
+    .macro MUL_ROW_ZERO
+        ldr     r1, [r0, #0]
+        movs    lr, #0
+        movs    r12, #0
+        umaal   r12, lr, r1, r4
+        str     r12, [sp, #0]
+        movs    r12, #0
+        umaal   r12, lr, r1, r5
+        str     r12, [sp, #4]
+        movs    r12, #0
+        umaal   r12, lr, r1, r6
+        str     r12, [sp, #8]
+        movs    r12, #0
+        umaal   r12, lr, r1, r7
+        str     r12, [sp, #12]
+        movs    r12, #0
+        umaal   r12, lr, r1, r8
+        str     r12, [sp, #16]
+        movs    r12, #0
+        umaal   r12, lr, r1, r9
+        str     r12, [sp, #20]
+        movs    r12, #0
+        umaal   r12, lr, r1, r10
+        str     r12, [sp, #24]
+        movs    r12, #0
+        umaal   r12, lr, r1, r11
+        str     r12, [sp, #28]
+        str     lr, [sp, #32]
+    .endm
+
+    // Phase 2 inner for reduction row i: m = t[i] * inv_low in r1, then 8
+    // UMAALs against p[0..7] in r4..r11. Final carry in lr for propagation.
+    .macro REDUCE_INNER_REG i
+        ldr     r1, [sp, #4*\i]
+        mul     r1, r1, r3
+        movs    lr, #0
+        UMAAL_STEP r4,  4*\i
+        UMAAL_STEP r5,  4*\i + 4
+        UMAAL_STEP r6,  4*\i + 8
+        UMAAL_STEP r7,  4*\i + 12
+        UMAAL_STEP r8,  4*\i + 16
+        UMAAL_STEP r9,  4*\i + 20
+        UMAAL_STEP r10, 4*\i + 24
+        UMAAL_STEP r11, 4*\i + 28
+    .endm
+
+    // Adds lr (final carry) into t[at_off], setting flags for the ADC chain.
+    .macro ADD_CARRY_AT at_off
+        ldr     r1, [sp, #\at_off]
+        adds    r1, r1, lr
+        str     r1, [sp, #\at_off]
+    .endm
+
+    // Propagates the carry flag one word up the accumulator.
+    .macro ADC_ZERO_AT at_off
+        ldr     r1, [sp, #\at_off]
+        adcs    r1, r1, #0
+        str     r1, [sp, #\at_off]
+    .endm
+
+    .section .ram_text.mul_reduce_armv8m,"ax",%progbits
+    .align 2
+    .global mul_reduce_armv8m
+    .type mul_reduce_armv8m, %function
+    .thumb_func
+mul_reduce_armv8m:
+    push    {{r4-r11, lr}}
+    sub     sp, sp, #64
+
+    // t[0..15] is not zero-initialized. MUL_ROW_ZERO writes t[0..8] for
+    // row 0 using movs-seeded UMAALs, and row i's final-carry STR writes
+    // t[i+8] before any subsequent UMAAL reads it.
+
+    // Preload b[0..7] into r4..r11. Stays live for all of Phase 1.
+    ldm     r1, {{r4-r11}}
+
+    // ----- Phase 1: schoolbook a * b -> t[0..16] -----
+    MUL_ROW_ZERO
+    MUL_ROW_REG 1
+    MUL_ROW_REG 2
+    MUL_ROW_REG 3
+    MUL_ROW_REG 4
+    MUL_ROW_REG 5
+    MUL_ROW_REG 6
+    MUL_ROW_REG 7
+
+    // Reload r4..r11 with p[0..7] for Phase 2. b[] is no longer needed.
+    ldm     r2, {{r4-r11}}
+
+    // ----- Phase 2: Montgomery reduction, 8 rows with carry propagation -----
+    REDUCE_INNER_REG 0
+    ADD_CARRY_AT 32
+    ADC_ZERO_AT 36
+    ADC_ZERO_AT 40
+    ADC_ZERO_AT 44
+    ADC_ZERO_AT 48
+    ADC_ZERO_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 1
+    ADD_CARRY_AT 36
+    ADC_ZERO_AT 40
+    ADC_ZERO_AT 44
+    ADC_ZERO_AT 48
+    ADC_ZERO_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 2
+    ADD_CARRY_AT 40
+    ADC_ZERO_AT 44
+    ADC_ZERO_AT 48
+    ADC_ZERO_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 3
+    ADD_CARRY_AT 44
+    ADC_ZERO_AT 48
+    ADC_ZERO_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 4
+    ADD_CARRY_AT 48
+    ADC_ZERO_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 5
+    ADD_CARRY_AT 52
+    ADC_ZERO_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 6
+    ADD_CARRY_AT 56
+    ADC_ZERO_AT 60
+
+    REDUCE_INNER_REG 7
+    ADD_CARRY_AT 60
+
+    // ----- Copy result t[8..16] back to this[0..8] -----
+    ldr     r1, [sp, #32]
+    str     r1, [r0, #0]
+    ldr     r1, [sp, #36]
+    str     r1, [r0, #4]
+    ldr     r1, [sp, #40]
+    str     r1, [r0, #8]
+    ldr     r1, [sp, #44]
+    str     r1, [r0, #12]
+    ldr     r1, [sp, #48]
+    str     r1, [r0, #16]
+    ldr     r1, [sp, #52]
+    str     r1, [r0, #20]
+    ldr     r1, [sp, #56]
+    str     r1, [r0, #24]
+    ldr     r1, [sp, #60]
+    str     r1, [r0, #28]
+
+    add     sp, sp, #64
+    pop     {{r4-r11, lr}}
+    bx      lr
+
+    .size mul_reduce_armv8m, . - mul_reduce_armv8m
+    "#,
+);
+
+// ---------------------------------------------------------------------------
+// u32-limb SOS Montgomery reduction, used as a design reference for the
+// ARMv8-M asm that replaces `mul_reduce_asm`. The inner step
+//     t[i+j] = t[i+j] + a[i]*b[j] + carry
+// maps 1-to-1 onto UMAAL, wich is the instruction LLVM refuses to emit on
+// thumbv8m.main. Keeping a host-runnable Rust version of the same algorithm
+// lets us cross-check the asm's numerical output against a golden reference
+// without round-tripping to hardware.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn mul_reduce_u32_ref(
+    this: &mut [u128; 2],
+    by: &[u128; 2],
+    modulus: &[u128; 2],
+    inv: u128,
+) {
+    let a = split128(this);
+    let b = split128(by);
+    let p = split128(modulus);
+    let inv_low = inv as u32;
+
+    let mut t = [0u32; 17];
+
+    // Phase 1: schoolbook a * b -> t[0..16]
+    for i in 0..8 {
+        let mut carry: u32 = 0;
+        for j in 0..8 {
+            let sum = (a[i] as u64) * (b[j] as u64) + (t[i + j] as u64) + (carry as u64);
+            t[i + j] = sum as u32;
+            carry = (sum >> 32) as u32;
+        }
+        t[i + 8] = carry;
+    }
+
+    // Phase 2: Montgomery reduction, 8 iterations
+    for i in 0..8 {
+        let m = t[i].wrapping_mul(inv_low);
+        let mut carry: u32 = 0;
+        for j in 0..8 {
+            let sum = (m as u64) * (p[j] as u64) + (t[i + j] as u64) + (carry as u64);
+            t[i + j] = sum as u32;
+            carry = (sum >> 32) as u32;
+        }
+        // Propagate carry into higher words. For the BN254 Fq/Fr moduli
+        // (both < 2^254) the carry always absorbs before t[16]; the extra
+        // word is kept for robustness against any future odd modulus.
+        let mut k = i + 8;
+        while carry != 0 && k < 17 {
+            let sum = (t[k] as u64) + (carry as u64);
+            t[k] = sum as u32;
+            carry = (sum >> 32) as u32;
+            k += 1;
+        }
+    }
+
+    let result = [t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]];
+    *this = combine128(&result);
+}
+
+#[cfg(test)]
+fn split128(x: &[u128; 2]) -> [u32; 8] {
+    [
+        x[0] as u32,
+        (x[0] >> 32) as u32,
+        (x[0] >> 64) as u32,
+        (x[0] >> 96) as u32,
+        x[1] as u32,
+        (x[1] >> 32) as u32,
+        (x[1] >> 64) as u32,
+        (x[1] >> 96) as u32,
+    ]
+}
+
+#[cfg(test)]
+fn combine128(r: &[u32; 8]) -> [u128; 2] {
+    [
+        (r[0] as u128)
+            | ((r[1] as u128) << 32)
+            | ((r[2] as u128) << 64)
+            | ((r[3] as u128) << 96),
+        (r[4] as u128)
+            | ((r[5] as u128) << 32)
+            | ((r[6] as u128) << 64)
+            | ((r[7] as u128) << 96),
+    ]
+}
+
+#[cfg(test)]
+mod mul_reduce_ref_tests {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    // BN254 Fq and Fr parameters, matching the `field_impl!` invocations in
+    // src/fields/fp.rs. The [u64; 4] limb form from that file packs into
+    // [u128; 2] as (hi64 << 64) | lo64 per limb pair.
+    const FQ_MODULUS: [u128; 2] = [
+        0x97816a916871ca8d3c208c16d87cfd47,
+        0x30644e72e131a029b85045b68181585d,
+    ];
+    const FQ_INV: u128 = 0x9ede7d651eca6ac987d20782e4866389;
+
+    const FR_MODULUS: [u128; 2] = [
+        0x2833e84879b9709143e1f593f0000001,
+        0x30644e72e131a029b85045b68181585d,
+    ];
+    const FR_INV: u128 = 0x6586864b4c6911b3c2e1f593efffffff;
+
+    fn random_under(rng: &mut StdRng, modulus: &[u128; 2]) -> [u128; 2] {
+        loop {
+            let v: [u128; 2] = [rng.gen(), rng.gen()];
+            if v[1] < modulus[1] || (v[1] == modulus[1] && v[0] < modulus[0]) {
+                return v;
+            }
+        }
+    }
+
+    fn rand_reduce_matches(seed: [u8; 32], modulus: &[u128; 2], inv: u128, iters: usize) {
+        let mut rng = StdRng::from_seed(seed);
+        for _ in 0..iters {
+            let a = random_under(&mut rng, modulus);
+            let b = random_under(&mut rng, modulus);
+
+            let mut via_rust = a;
+            super::mul_reduce_rust(&mut via_rust, &b, modulus, inv);
+
+            let mut via_ref = a;
+            super::mul_reduce_u32_ref(&mut via_ref, &b, modulus, inv);
+
+            assert_eq!(via_rust, via_ref, "mismatch: a={:x?} b={:x?}", a, b);
+        }
+    }
+
+    #[test]
+    fn fq_matches_rust() {
+        rand_reduce_matches([0x11u8; 32], &FQ_MODULUS, FQ_INV, 10_000);
+    }
+
+    #[test]
+    fn fr_matches_rust() {
+        rand_reduce_matches([0x22u8; 32], &FR_MODULUS, FR_INV, 10_000);
+    }
 }
 
 #[test]

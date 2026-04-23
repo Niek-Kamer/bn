@@ -12,6 +12,9 @@ edition = "2018"
 
 [features]
 default = []
+# Route mul_reduce through a hand-written ARMv8-M asm path using UMAAL
+# on 32-bit limbs. Only has effect on target_arch = "arm"; off by default.
+cortex-m33-asm = []
 
 [[bench]]
 name = "api"
