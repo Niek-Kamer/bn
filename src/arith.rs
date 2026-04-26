@@ -1,6 +1,6 @@
 use core::cmp::Ordering;
-use rand::Rng;
 use crunchy::unroll;
+use rand::Rng;
 
 use byteorder::{BigEndian, ByteOrder};
 
@@ -79,7 +79,7 @@ impl U512 {
         U512(res)
     }
 
-     pub fn from_slice(s: &[u8]) -> Result<U512, Error> {
+    pub fn from_slice(s: &[u8]) -> Result<U512, Error> {
         if s.len() != 64 {
             return Err(Error::InvalidLength {
                 expected: 32,
@@ -371,7 +371,7 @@ impl U256 {
 
     /// Return an Iterator<Item=bool> over all bits from
     /// MSB to LSB.
-    pub fn bits(&self) -> BitIterator {
+    pub fn bits(&self) -> BitIterator<'_> {
         BitIterator { int: &self, n: 256 }
     }
 }
@@ -559,12 +559,7 @@ fn mul_reduce_rust(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], in
 #[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
 fn mul_reduce_asm(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
     extern "C" {
-        fn mul_reduce_armv8m(
-            this: *mut u32,
-            by: *const u32,
-            modulus: *const u32,
-            inv_low: u32,
-        );
+        fn mul_reduce_armv8m(this: *mut u32, by: *const u32, modulus: *const u32, inv_low: u32);
     }
     // [u128; 2] is 32 bytes with 16-byte alignment, which is a valid view
     // as 8 × u32 in the same memory (u32 needs 4-byte alignment). The asm
@@ -825,13 +820,8 @@ mul_reduce_armv8m:
 // without round-tripping to hardware.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-fn mul_reduce_u32_ref(
-    this: &mut [u128; 2],
-    by: &[u128; 2],
-    modulus: &[u128; 2],
-    inv: u128,
-) {
+#[cfg(any(test, feature = "test-harness"))]
+fn mul_reduce_u32_ref(this: &mut [u128; 2], by: &[u128; 2], modulus: &[u128; 2], inv: u128) {
     let a = split128(this);
     let b = split128(by);
     let p = split128(modulus);
@@ -875,7 +865,7 @@ fn mul_reduce_u32_ref(
     *this = combine128(&result);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-harness"))]
 fn split128(x: &[u128; 2]) -> [u32; 8] {
     [
         x[0] as u32,
@@ -889,23 +879,94 @@ fn split128(x: &[u128; 2]) -> [u32; 8] {
     ]
 }
 
-#[cfg(test)]
+// ── Embedded self-test harness ────────────────────────────────────────────
+// Compiled only when `cortex-m33-asm` + `test-harness` + ARM target are all
+// active. Uses an inline splitmix64 PRNG so there is no std/rand dependency.
+
+#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+fn sm64(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+fn sm_under(s: &mut u64, modulus: &[u128; 2]) -> [u128; 2] {
+    loop {
+        let lo = (sm64(s) as u128) | ((sm64(s) as u128) << 64);
+        let hi = (sm64(s) as u128) | ((sm64(s) as u128) << 64);
+        let v = [lo, hi];
+        if v[1] < modulus[1] || (v[1] == modulus[1] && v[0] < modulus[0]) {
+            return v;
+        }
+    }
+}
+
+/// Cross-check the UMAAL asm `mul_reduce` against `mul_reduce_u32_ref` for
+/// `iters` random Fq input pairs. Returns `true` if every output matches.
+/// Enabled by `feature = "test-harness"` — not present in production builds.
+#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+pub fn selftest_fq(seed: u64, iters: u32) -> bool {
+    const MODULUS: [u128; 2] = [
+        0x97816a916871ca8d3c208c16d87cfd47,
+        0x30644e72e131a029b85045b68181585d,
+    ];
+    const INV: u128 = 0x9ede7d651eca6ac987d20782e4866389;
+    let mut s = seed;
+    let mut i = 0u32;
+    while i < iters {
+        let a = sm_under(&mut s, &MODULUS);
+        let b = sm_under(&mut s, &MODULUS);
+        let mut via_asm = a;
+        mul_reduce(&mut via_asm, &b, &MODULUS, INV);
+        let mut via_ref = a;
+        mul_reduce_u32_ref(&mut via_ref, &b, &MODULUS, INV);
+        if via_asm != via_ref {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Same as `selftest_fq` but over the BN254 Fr scalar field.
+#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+pub fn selftest_fr(seed: u64, iters: u32) -> bool {
+    const MODULUS: [u128; 2] = [
+        0x2833e84879b9709143e1f593f0000001,
+        0x30644e72e131a029b85045b68181585d,
+    ];
+    const INV: u128 = 0x6586864b4c6911b3c2e1f593efffffff;
+    let mut s = seed;
+    let mut i = 0u32;
+    while i < iters {
+        let a = sm_under(&mut s, &MODULUS);
+        let b = sm_under(&mut s, &MODULUS);
+        let mut via_asm = a;
+        mul_reduce(&mut via_asm, &b, &MODULUS, INV);
+        let mut via_ref = a;
+        mul_reduce_u32_ref(&mut via_ref, &b, &MODULUS, INV);
+        if via_asm != via_ref {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(any(test, feature = "test-harness"))]
 fn combine128(r: &[u32; 8]) -> [u128; 2] {
     [
-        (r[0] as u128)
-            | ((r[1] as u128) << 32)
-            | ((r[2] as u128) << 64)
-            | ((r[3] as u128) << 96),
-        (r[4] as u128)
-            | ((r[5] as u128) << 32)
-            | ((r[6] as u128) << 64)
-            | ((r[7] as u128) << 96),
+        (r[0] as u128) | ((r[1] as u128) << 32) | ((r[2] as u128) << 64) | ((r[3] as u128) << 96),
+        (r[4] as u128) | ((r[5] as u128) << 32) | ((r[6] as u128) << 64) | ((r[7] as u128) << 96),
     ]
 }
 
 #[cfg(test)]
 mod mul_reduce_ref_tests {
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     // BN254 Fq and Fr parameters, matching the `field_impl!` invocations in
     // src/fields/fp.rs. The [u64; 4] limb form from that file packs into
@@ -955,6 +1016,47 @@ mod mul_reduce_ref_tests {
     #[test]
     fn fr_matches_rust() {
         rand_reduce_matches([0x22u8; 32], &FR_MODULUS, FR_INV, 10_000);
+    }
+
+    // Cross-check the hand-written ARMv8-M asm against the portable u32
+    // reference.  These tests are compiled and runnable only when the asm
+    // path is actually active: `feature = "cortex-m33-asm"` on an ARM
+    // target.  Run them on the Pico (or under a Cortex-M QEMU) with:
+    //   cargo test --target thumbv8m.main-none-eabihf \
+    //               --features cortex-m33-asm
+    // On x86-64 / aarch64 the tests are omitted; `mul_reduce` uses
+    // `mul_reduce_rust` there and `fq_matches_rust` / `fr_matches_rust`
+    // already cover that path.
+    #[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+    fn rand_reduce_asm_matches(seed: [u8; 32], modulus: &[u128; 2], inv: u128, iters: usize) {
+        let mut rng = StdRng::from_seed(seed);
+        for _ in 0..iters {
+            let a = random_under(&mut rng, modulus);
+            let b = random_under(&mut rng, modulus);
+
+            // `mul_reduce` dispatches to the asm when the feature + target
+            // are active.  We compare its output against the portable u32
+            // reference to catch any carry-chain bug in the assembly.
+            let mut via_asm = a;
+            super::mul_reduce(&mut via_asm, &b, modulus, inv);
+
+            let mut via_ref = a;
+            super::mul_reduce_u32_ref(&mut via_ref, &b, modulus, inv);
+
+            assert_eq!(via_asm, via_ref, "asm/ref mismatch: a={:x?} b={:x?}", a, b);
+        }
+    }
+
+    #[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+    #[test]
+    fn fq_asm_matches_ref() {
+        rand_reduce_asm_matches([0x33u8; 32], &FQ_MODULUS, FQ_INV, 10_000);
+    }
+
+    #[cfg(all(feature = "cortex-m33-asm", target_arch = "arm"))]
+    #[test]
+    fn fr_asm_matches_ref() {
+        rand_reduce_asm_matches([0x44u8; 32], &FR_MODULUS, FR_INV, 10_000);
     }
 }
 

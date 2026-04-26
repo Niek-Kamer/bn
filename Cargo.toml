@@ -15,6 +15,9 @@ default = []
 # Route mul_reduce through a hand-written ARMv8-M asm path using UMAAL
 # on 32-bit limbs. Only has effect on target_arch = "arm"; off by default.
 cortex-m33-asm = []
+# Expose `arith::selftest_fq` / `arith::selftest_fr` for on-device testing.
+# Only meaningful together with `cortex-m33-asm` on an ARM target.
+test-harness = []
 
 [[bench]]
 name = "api"

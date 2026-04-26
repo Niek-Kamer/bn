@@ -1,19 +1,7 @@
+use crate::arith::{U256, U512};
+use crate::fields::{const_fq, FieldElement, Fq};
 use core::ops::{Add, Mul, Neg, Sub};
 use rand::Rng;
-use crate::fields::{const_fq, FieldElement, Fq};
-use crate::arith::{U256, U512};
-
-#[inline]
-fn fq_non_residue() -> Fq {
-    // (q - 1) is a quadratic nonresidue in Fq
-    // 21888242871839275222246405745257275088696311157297823662689037894645226208582
-    const_fq([
-        0x68c3488912edefaa,
-        0x8d087f6872aabf4f,
-        0x51e1a24709081231,
-        0x2259d6b14729c0fa,
-    ])
-}
 
 #[inline]
 pub fn fq2_nonresidue() -> Fq2 {
@@ -42,7 +30,7 @@ pub struct Fq2 {
 
 impl Fq2 {
     pub fn new(c0: Fq, c1: Fq) -> Self {
-        Fq2 { c0: c0, c1: c1 }
+        Fq2 { c0, c1 }
     }
 
     pub fn scale(&self, by: Fq) -> Self {
@@ -62,7 +50,7 @@ impl Fq2 {
         } else {
             Fq2 {
                 c0: self.c0,
-                c1: self.c1 * fq_non_residue(),
+                c1: -self.c1,
             }
         }
     }
@@ -103,15 +91,10 @@ impl FieldElement for Fq2 {
     }
 
     fn squared(&self) -> Self {
-        // Devegili OhEig Scott Dahab
-        //     Multiplication and Squaring on Pairing-Friendly Fields.pdf
-        //     Section 3 (Complex squaring)
-
+        // BN254: u² = -1, so (a+bu)² = (a²-b²) + 2ab·u
         let ab = self.c0 * self.c1;
-
         Fq2 {
-            c0: (self.c1 * fq_non_residue() + self.c0) * (self.c0 + self.c1) - ab
-                - ab * fq_non_residue(),
+            c0: (self.c0 - self.c1) * (self.c0 + self.c1),
             c1: ab + ab,
         }
     }
@@ -120,7 +103,8 @@ impl FieldElement for Fq2 {
         // "High-Speed Software Implementation of the Optimal Ate Pairing
         // over Barreto–Naehrig Curves"; Algorithm 8
 
-        match (self.c0.squared() - (self.c1.squared() * fq_non_residue())).inverse() {
+        // BN254: u² = -1, so N(a+bu) = a² + b²
+        match (self.c0.squared() + self.c1.squared()).inverse() {
             Some(t) => Some(Fq2 {
                 c0: self.c0 * t,
                 c1: -(self.c1 * t),
@@ -141,8 +125,9 @@ impl Mul for Fq2 {
         let aa = self.c0 * other.c0;
         let bb = self.c1 * other.c1;
 
+        // BN254: u² = -1, so (a+bu)(c+du) = (ac-bd) + (ad+bc)·u
         Fq2 {
-            c0: bb * fq_non_residue() + aa,
+            c0: aa - bb,
             c1: (self.c0 + self.c1) * (other.c0 + other.c1) - aa - bb,
         }
     }
@@ -231,30 +216,76 @@ impl Fq2 {
     }
 }
 
-
 #[test]
 fn sqrt_fq2() {
     // from zcash test_proof.cpp
     let x1 = Fq2::new(
-        Fq::from_str("12844195307879678418043983815760255909500142247603239203345049921980497041944").unwrap(),
-        Fq::from_str("7476417578426924565731404322659619974551724117137577781074613937423560117731").unwrap(),
+        Fq::from_str(
+            "12844195307879678418043983815760255909500142247603239203345049921980497041944",
+        )
+        .unwrap(),
+        Fq::from_str(
+            "7476417578426924565731404322659619974551724117137577781074613937423560117731",
+        )
+        .unwrap(),
     );
 
     let x2 = Fq2::new(
-        Fq::from_str("3345897230485723946872934576923485762803457692345760237495682347502347589474").unwrap(),
-        Fq::from_str("1234912378405347958234756902345768290345762348957605678245967234857634857676").unwrap(),
+        Fq::from_str(
+            "3345897230485723946872934576923485762803457692345760237495682347502347589474",
+        )
+        .unwrap(),
+        Fq::from_str(
+            "1234912378405347958234756902345768290345762348957605678245967234857634857676",
+        )
+        .unwrap(),
     );
 
     assert_eq!(x2.sqrt().unwrap(), x1);
 
     // i is sqrt(-1)
-    assert_eq!(
-        Fq2::one().neg().sqrt().unwrap(),
-        Fq2::i(),
-    );
+    assert_eq!(Fq2::one().neg().sqrt().unwrap(), Fq2::i(),);
 
     // no sqrt for (1 + 2i)
     assert!(
-        Fq2::new(Fq::from_str("1").unwrap(), Fq::from_str("2").unwrap()).sqrt().is_none()
+        Fq2::new(Fq::from_str("1").unwrap(), Fq::from_str("2").unwrap())
+            .sqrt()
+            .is_none()
     );
+}
+
+// Run with: just bench-fq2
+// Prints ns/op for mul and squared; compare before/after patching.
+#[test]
+fn bench_fq2_ops() {
+    extern crate std;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use rand::SeedableRng;
+    let seed = [42u8; 32];
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
+    let a = Fq2::random(&mut rng);
+    let b = Fq2::random(&mut rng);
+    let n = 100_000usize;
+
+    let mut acc = a;
+    for _ in 0..1_000 {
+        acc = acc * b;
+    }
+
+    let t = Instant::now();
+    for _ in 0..n {
+        acc = black_box(acc * b);
+    }
+    let mul_ns = t.elapsed().as_nanos() as f64 / n as f64;
+
+    let t = Instant::now();
+    for _ in 0..n {
+        acc = black_box(acc.squared());
+    }
+    let sq_ns = t.elapsed().as_nanos() as f64 / n as f64;
+
+    black_box(acc);
+    std::eprintln!("[bench_fq2] mul={mul_ns:.1}ns/op  squared={sq_ns:.1}ns/op  (n={n})");
 }

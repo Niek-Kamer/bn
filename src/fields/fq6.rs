@@ -99,11 +99,7 @@ pub struct Fq6 {
 
 impl Fq6 {
     pub fn new(c0: Fq2, c1: Fq2, c2: Fq2) -> Self {
-        Fq6 {
-            c0: c0,
-            c1: c1,
-            c2: c2,
-        }
+        Fq6 { c0, c1, c2 }
     }
 
     pub fn mul_by_nonresidue(&self) -> Self {
