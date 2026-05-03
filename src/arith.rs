@@ -883,7 +883,11 @@ fn split128(x: &[u128; 2]) -> [u32; 8] {
 // Compiled only when `cortex-m33-asm` + `test-harness` + ARM target are all
 // active. Uses an inline splitmix64 PRNG so there is no std/rand dependency.
 
-#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+#[cfg(all(
+    feature = "cortex-m33-asm",
+    feature = "test-harness",
+    target_arch = "arm"
+))]
 fn sm64(s: &mut u64) -> u64 {
     *s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *s;
@@ -892,7 +896,11 @@ fn sm64(s: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+#[cfg(all(
+    feature = "cortex-m33-asm",
+    feature = "test-harness",
+    target_arch = "arm"
+))]
 fn sm_under(s: &mut u64, modulus: &[u128; 2]) -> [u128; 2] {
     loop {
         let lo = (sm64(s) as u128) | ((sm64(s) as u128) << 64);
@@ -907,7 +915,11 @@ fn sm_under(s: &mut u64, modulus: &[u128; 2]) -> [u128; 2] {
 /// Cross-check the UMAAL asm `mul_reduce` against `mul_reduce_u32_ref` for
 /// `iters` random Fq input pairs. Returns `true` if every output matches.
 /// Enabled by `feature = "test-harness"` — not present in production builds.
-#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+#[cfg(all(
+    feature = "cortex-m33-asm",
+    feature = "test-harness",
+    target_arch = "arm"
+))]
 pub fn selftest_fq(seed: u64, iters: u32) -> bool {
     const MODULUS: [u128; 2] = [
         0x97816a916871ca8d3c208c16d87cfd47,
@@ -932,7 +944,11 @@ pub fn selftest_fq(seed: u64, iters: u32) -> bool {
 }
 
 /// Same as `selftest_fq` but over the BN254 Fr scalar field.
-#[cfg(all(feature = "cortex-m33-asm", feature = "test-harness", target_arch = "arm"))]
+#[cfg(all(
+    feature = "cortex-m33-asm",
+    feature = "test-harness",
+    target_arch = "arm"
+))]
 pub fn selftest_fr(seed: u64, iters: u32) -> bool {
     const MODULUS: [u128; 2] = [
         0x2833e84879b9709143e1f593f0000001,
